@@ -1,0 +1,1881 @@
+
+--------------------------------------------------------------------
+-- CONFIG -----------------------------------------------------------
+--------------------------------------------------------------------
+
+local CONFIG = {
+	-- Zero-dependency FILE channel: the AI agent drops a command JSON at
+	-- cmdFileName() in this executor's workspace; the script answers via
+	-- resFileName(). No node, no extra server, nothing to start.
+
+	CmdRpcMagic           = "rmcp-rpc-1",
+	SessionFile           = "ReverseMCP.session.%s.json",  -- %s = suffix hash of the run uuid
+	CmdFile               = "ReverseMCP.cmd.%s.json",
+	ResFile               = "ReverseMCP.res.%s.json",
+
+	PollIntervalMs        = 600,              -- file scan cadence, 250 .. 5000 clamp
+	StatusRefreshS        = 1.0,
+	SessionPingS          = 5,                -- heartbeat rewrite of the session file
+
+	StateFile             = "ReverseMCP.state.%s.json",    -- per-run state (suffix)
+	StateFileLegacy       = "ReverseMCP.state.json",         -- pre-multi-session file, imported once
+	SourceCandidates      = { "ReverseMCP.client.obfuscated.luau", "ReverseMCP.client.luau" },
+
+	ExploreDefaults       = { depth = 3, maxNodes = 800 },
+	ExploreMax            = { depth = 6, maxNodes = 5000 },
+	SearchLimitDefault    = 200,
+	SearchScanCap         = 60000,
+
+	RemoteBufferCap       = 400,
+	ArgDepth              = 4,
+	RemoteIncomingCap     = 500,
+	DecodeSourceCap       = 300000,
+
+	Defaults = {
+		Master           = true,
+		Spy              = true,
+		Incoming         = false,
+		AllowRemoteAdds  = true,
+		AllowInterpret   = true,
+		AutoRestart      = true,
+	},
+}
+
+local VERSION = "1.0.0"
+
+-- clamp is NOT a builtin global in Roblox Luau (only math.clamp) — alias it once.
+local clamp = math.clamp
+
+--------------------------------------------------------------------
+-- SERVICES + CAPABILITY PROBE --------------------------------------
+--------------------------------------------------------------------
+
+local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local LogService  = game:GetService("LogService")
+local workspaceRef = workspace
+
+local RequestFn = (syn and syn.request) or (http and http.request) or http_request or (request)
+
+local Capabilities = {
+	request          = typeof(RequestFn) == "function",
+	hookmetamethod   = typeof(hookmetamethod) == "function",
+	newcclosure      = typeof(newcclosure) == "function",
+	getnamecallmethod= typeof(getnamecallmethod) == "function",
+	getcallingscript = typeof(getcallingscript) == "function",
+	queue_on_teleport= typeof(queue_on_teleport) == "function",
+	filesystem       = (typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function"),
+	deletefile       = typeof(delfile) == "function",
+	clipboard        = (typeof(setclipboard) == "function" or typeof(toclipboard) == "function"),
+	identifier       = typeof(identifyexecutor) == "function",
+	decompile        = typeof(decompile) == "function",
+	bytecode         = typeof(getscriptbytecode) == "function",
+}
+
+local function executorLabel()
+	if Capabilities.identifier then
+		local ok, v = pcall(function() return identifyexecutor() end)
+		if ok and type(v) == "string" and #v > 0 then return v end
+	end
+	return "unknown executor"
+end
+
+local EXECUTOR = executorLabel()
+
+--------------------------------------------------------------------
+-- STATE ------------------------------------------------------------
+--------------------------------------------------------------------
+
+local State = {
+	running         = false,
+	enabled         = CONFIG.Defaults.Master,
+	spy             = CONFIG.Defaults.Spy,
+	incoming        = CONFIG.Defaults.Incoming,
+	allowRemoteAdds = CONFIG.Defaults.AllowRemoteAdds,
+	allowInterpret  = CONFIG.Defaults.AllowInterpret,
+	autoRestart     = CONFIG.Defaults.AutoRestart,
+	pollMs          = CONFIG.PollIntervalMs,
+	token           = nil,
+	suffix          = nil,
+	gameId          = 0,
+	placeId         = 0,
+}
+
+-- per-run file names derived from the run uuid's short suffix — this is what
+-- lets several executor runs (several games / windows) live side by side
+local function sessionSuffix()
+	if State.suffix then return State.suffix end
+	local h = 2166136261
+	for i = 1, #State.token do
+		h = h * 31 + string.byte(State.token, i)
+		h = h % 4294967296
+	end
+	State.suffix = ("%08x"):format(h)
+	return State.suffix
+end
+
+local function cmdFileName()     return CONFIG.CmdFile:format(sessionSuffix()) end
+local function resFileName()     return CONFIG.ResFile:format(sessionSuffix()) end
+local function sessionFileName() return CONFIG.SessionFile:format(sessionSuffix()) end
+local function stateFileName()   return CONFIG.StateFile:format(sessionSuffix()) end
+
+local Session = {
+	joinTime        = os.time(),
+	teleportHistory = {},
+}
+
+local UI = {}
+
+--------------------------------------------------------------------
+-- STATE FILE -------------------------------------------------------
+--------------------------------------------------------------------
+
+local function fsAvailable()
+	return Capabilities.filesystem == true
+end
+
+local function saveState()
+	if not fsAvailable() then return false end
+	local blob = {
+		version     = VERSION,
+		uuid        = State.token,
+		suffix      = sessionSuffix(),
+		transport   = "file",
+		enabled     = State.enabled,
+		spy         = State.spy,
+		incoming    = State.incoming,
+		allowRemote = State.allowRemoteAdds,
+		allowInterp = State.allowInterpret,
+		autoRestart = State.autoRestart,
+		pollMs      = State.pollMs,
+		gameId      = State.gameId or 0,
+		placeId     = State.placeId or 0,
+		executor    = EXECUTOR,
+	}
+	local ok, payload = pcall(function() return HttpService:JSONEncode(blob) end)
+	if not ok or type(payload) ~= "string" then return false end
+	return pcall(writefile, stateFileName(), payload)
+end
+
+local function loadState()
+	if not fsAvailable() then return end
+	-- legacy single-session file: import once, then move on to per-run naming
+	local sourceName = nil
+	local okL1, exists1 = pcall(isfile, stateFileName())
+	if okL1 and exists1 then
+		sourceName = stateFileName()
+	else
+		local okL2, exists2 = pcall(isfile, CONFIG.StateFileLegacy)
+		if okL2 and exists2 then sourceName = CONFIG.StateFileLegacy end
+	end
+	if not sourceName then return end
+	local okR, content = pcall(readfile, sourceName)
+	if not okR or type(content) ~= "string" then return end
+	local okD, decoded = pcall(HttpService.JSONDecode, HttpService, content)
+	if not okD or type(decoded) ~= "table" then return end
+	if type(decoded.enabled) == "boolean" then State.enabled = decoded.enabled end
+	if type(decoded.spy) == "boolean" then State.spy = decoded.spy end
+	if type(decoded.incoming) == "boolean" then State.incoming = decoded.incoming end
+	if type(decoded.allowRemote) == "boolean" then State.allowRemoteAdds = decoded.allowRemote end
+	if type(decoded.allowInterp) == "boolean" then State.allowInterpret = decoded.allowInterp end
+	if type(decoded.autoRestart) == "boolean" then State.autoRestart = decoded.autoRestart end
+	if type(decoded.pollMs) == "number" and decoded.pollMs >= 250 and decoded.pollMs <= 5000 then
+		State.pollMs = math.floor(decoded.pollMs)
+	end
+	if type(decoded.token) == "string" and #decoded.token >= 8 and #decoded.token <= 96 then
+		State.token = decoded.token
+	elseif type(decoded.uuid) == "string" and #decoded.uuid >= 8 and #decoded.uuid <= 96 then
+		State.token = decoded.uuid
+	end
+	if type(decoded.gameId) == "number" then State.gameId = decoded.gameId end
+	if type(decoded.placeId) == "number" then State.placeId = decoded.placeId end
+end
+
+local function newSessionToken()
+	local bytes = {}
+	for i = 1, 16 do
+		table.insert(bytes, ("0123456789abcdef"):sub(math.random(1, 16), math.random(1, 16)))
+	end
+	return ("rmcp-%d-%s"):format(os.time(), table.concat(bytes))
+end
+
+if not State.token then
+	State.token = newSessionToken()
+end
+
+loadState()
+
+-- teleport detection: previous state file placeId != current placeId (same universe)
+if State.placeId ~= 0 and State.placeId ~= game.PlaceId and State.gameId == game.GameId then
+	table.insert(Session.teleportHistory, { t = os.time(), from = State.placeId, to = game.PlaceId })
+	if #Session.teleportHistory > 20 then
+		table.remove(Session.teleportHistory, 1)
+	end
+end
+
+-- zero-fill: a fresh install stores the real place/universe ids so the
+-- teleport bootstrap matches immediately (without this the launch check
+-- would compare 0 against the live GameId and silently refuse to boot)
+if State.gameId == 0 then State.gameId = game.GameId end
+if State.placeId == 0 then State.placeId = game.PlaceId end
+saveState()
+
+--------------------------------------------------------------------
+-- PATH HELPERS -----------------------------------------------------
+--------------------------------------------------------------------
+
+local function plainIdentifier(n)
+	return type(n) == "string" and #n > 0 and n:match("[^%w_]") == nil and n:sub(1, 1):match("%d") == nil
+end
+
+local function quoteSegment(name)
+	if plainIdentifier(name) then
+		return "." .. name
+	end
+	local esc = tostring(name)
+		:gsub("\\", "\\\\")
+		:gsub('"', '\\"')
+		:gsub("\n", "\\n")
+		:gsub("\r", "\\r")
+		:gsub("\t", "\\t")
+	return ('["%s"]'):format(esc)
+end
+
+local function pathOf(inst)
+	if typeof(inst) ~= "Instance" then return nil end
+	if inst == game then return "game" end
+	local parts = {}
+	local cur = inst
+	while typeof(cur) == "Instance" do
+		table.insert(parts, 1, quoteSegment(cur.Name))
+		if cur.Parent == game or cur.Parent == nil then break end
+		cur = cur.Parent
+	end
+	if #parts == 0 then return nil end
+	return "game" .. table.concat(parts, "")
+end
+
+local function readBracketSegment(text, pos)
+	-- expects text:sub(pos,pos) == '['
+	if text:sub(pos, pos) ~= "[" then return nil, pos end
+	local j = pos + 1
+	local first = text:sub(j, j)
+	if first == '"' then
+		local inner = {}
+		j = j + 1
+		while j <= #text do
+			local ch = text:sub(j, j)
+			if ch == "\\" and j < #text then
+				local nx = text:sub(j + 1, j + 1)
+				if nx == "n" then ch = "\n"
+				elseif nx == "r" then ch = "\r"
+				elseif nx == "t" then ch = "\t"
+				elseif nx == "\\" then ch = "\\"
+				elseif nx == '"' then ch = '"'
+				else ch = nx end
+				table.insert(inner, ch)
+				j = j + 2
+			elseif ch == '"' then
+				return table.concat(inner), j + 2   -- skip closing " and ]
+			else
+				table.insert(inner, ch)
+				j = j + 1
+			end
+		end
+		return nil, #text + 1
+	end
+	local digits = text:sub(j, j + 12):match("^%d+")
+	if digits then
+		return digits, j + #digits + 1
+	end
+	return nil, j + 1
+end
+
+local function resolvePath(text)
+	if type(text) ~= "string" then return nil, "path must be a string" end
+	text = text:gsub("^%s+", ""):gsub("%s+$", "")
+	if text == "" then return nil, "empty path" end
+
+	local head, endPos = nil, 1
+	while endPos <= #text do
+		local ch = text:sub(endPos, endPos)
+		if ch:match("[%w_]") == nil then break end
+		endPos = endPos + 1
+	end
+	head = text:sub(1, endPos - 1)
+
+	local cur
+	local i = endPos
+	if head == "game" then
+		cur = game
+		if text:sub(i, i) == "." then i = i + 1 end
+	elseif head == "workspace" or head == "Workspace" then
+		cur = workspaceRef
+		if text:sub(i, i) == "." then i = i + 1 end
+	else
+		return nil, "path must start with 'game.' or 'workspace.'"
+	end
+
+	local firstSegment = true
+	while i <= #text do
+		local ch = text:sub(i, i)
+		local seg
+		if ch == "." then
+			local e = i + 1
+			while e <= #text do
+				local c2 = text:sub(e, e)
+				if c2:match("[%w_]") == nil then break end
+				e = e + 1
+			end
+			seg = text:sub(i + 1, e - 1)
+			i = e
+		elseif ch == "[" then
+			local value, nextI = readBracketSegment(text, i)
+			if value == nil then
+				return nil, ("unreadable bracket token at position %d in %s"):format(i, text)
+			end
+			seg = value
+			i = nextI
+		else
+			return nil, ("unexpected character '%s' at position %d in %s"):format(ch, i, text)
+		end
+		-- container names are case-sensitive; accept any casing of the root
+		-- workspace node ("game.workspace", "game.Workspace", "game['workspace']")
+		if firstSegment and cur == game and seg:lower() == "workspace" then
+			cur = workspaceRef
+			firstSegment = false
+		else
+			firstSegment = false
+			if typeof(cur) ~= "Instance" then
+				return nil, ("path reaches a nil parent at segment '%s'"):format(tostring(seg))
+			end
+			local next_inst = cur:FindFirstChild(seg)
+			if next_inst == nil then
+				return nil, ("'%s' not found under %s"):format(tostring(seg), pathOf(cur) or "<root>")
+			end
+			cur = next_inst
+		end
+	end
+
+	return cur
+end
+
+--------------------------------------------------------------------
+-- SERIALIZATION ----------------------------------------------------
+--------------------------------------------------------------------
+
+local function serializeValue(value, depth, visited, budget)
+	depth = depth or 0
+	visited = visited or {}
+	budget = budget or { count = 0, cap = 512 }
+
+	if budget.count >= budget.cap then
+		return { t = "limit", repr = "<serialization cap reached>" }
+	end
+	budget.count = budget.count + 1
+
+	local ty = typeof(value)
+	if value == nil then
+		return nil
+	elseif ty == "number" then
+		if value ~= value then return { t = "number", repr = "nan" } end
+		if value == math.huge or value == -math.huge then return { t = "number", repr = tostring(value) } end
+		return value
+	elseif ty == "string" then
+		if #value > 12000 then
+			return { t = "string", truncated = true, repr = value:sub(1, 12000) .. "..." }
+		end
+		return value
+	elseif ty == "boolean" then
+		return value
+	elseif ty == "Instance" then
+		return { t = "Instance", path = pathOf(value) or "<detached>", name = value.Name, className = value.ClassName }
+	elseif ty == "Vector3" then
+		return { t = "Vector3", x = value.X, y = value.Y, z = value.Z }
+	elseif ty == "Vector2" then
+		return { t = "Vector2", x = value.X, y = value.Y }
+	elseif ty == "CFrame" then
+		return {
+			t     = "CFrame",
+			pos   = { x = value.Position.X, y = value.Position.Y, z = value.Position.Z },
+			look  = { x = value.LookVector.X, y = value.LookVector.Y, z = value.LookVector.Z },
+			right = { x = value.RightVector.X, y = value.RightVector.Y, z = value.RightVector.Z },
+		}
+	elseif ty == "Color3" then
+		local okHex, hex = pcall(function() return value:ToHex() end)
+		return { t = "Color3", r = value.R, g = value.G, b = value.B, hex = (okHex and hex) or nil }
+	elseif ty == "ColorSequence" then
+		local keypoints = {}
+		for i, kp in ipairs(value.Keypoints) do
+			keypoints[i] = { time = kp.Time, hex = kp.Value:ToHex() }
+		end
+		return { t = "ColorSequence", keypoints = keypoints }
+	elseif ty == "UDim2" then
+		return { t = "UDim2", x = { scale = value.X.Scale, offset = value.X.Offset }, y = { scale = value.Y.Scale, offset = value.Y.Offset } }
+	elseif ty == "Enum" then
+		return { t = "Enum", repr = tostring(value) }
+	elseif ty == "EnumItem" then
+		return { t = "EnumItem", name = tostring(value), value = value.Value, enumType = tostring(value.EnumType) }
+	elseif ty == "table" then
+		if depth >= CONFIG.ArgDepth then
+			return { t = "table", truncated = true, depth = depth }
+		end
+		if visited[value] then return { t = "table", cycle = true } end
+		visited[value] = true
+
+		local n, maxI = 0, 0
+		local isList = true
+		for k, _ in pairs(value) do
+			n = n + 1
+			if type(k) == "number" and k > maxI then maxI = k end
+			if type(k) ~= "number" or k <= 0 or k % 1 ~= 0 then isList = false end
+		end
+		if isList and n ~= maxI then isList = false end
+
+		if isList then
+			local out = {}
+			local lim = math.min(maxI, 64)
+			for i = 1, lim do
+				out[i] = serializeValue(value[i], depth + 1, visited, budget)
+				if budget.count >= budget.cap then break end
+			end
+			return out
+		end
+
+		local out = {}
+		local seen = 0
+		for k, v in pairs(value) do
+			seen = seen + 1
+			if seen > 64 then break end
+			out[(type(k) == "string" and plainIdentifier(k)) and k or tostring(k)] = serializeValue(v, depth + 1, visited, budget)
+			if budget.count >= budget.cap then break end
+		end
+		return out
+	else
+		return { t = tostring(ty), repr = tostring(value) }
+	end
+end
+
+local function jsonEscapeContent(s)
+	local out = {}
+	for i = 1, #s do
+		local b = string.byte(s, i)
+		if b == 34 then table.insert(out, '\\"')
+		elseif b == 92 then table.insert(out, "\\\\")
+		elseif b == 10 then table.insert(out, "\\n")
+		elseif b == 13 then table.insert(out, "\\r")
+		elseif b == 9 then table.insert(out, "\\t")
+		elseif b < 32 then table.insert(out, ("\\u%04x"):format(b))
+		else table.insert(out, string.sub(s, i, i)) end
+	end
+	return table.concat(out, "")
+end
+
+local function jsonEncode(v)
+	local ty = type(v)
+	if v == nil then return "null" end
+	if ty == "number" then
+		if v ~= v or v == math.huge or v == -math.huge then return "0" end
+		return ("%.14g"):format(v)
+	elseif ty == "string" then
+		return '"' .. jsonEscapeContent(v) .. '"'
+	elseif ty == "boolean" then
+		return v and "true" or "false"
+	elseif ty == "table" then
+		local n, maxI = 0, 0
+		local isList = true
+		for k, _ in pairs(v) do
+			n = n + 1
+			if type(k) == "number" and k > maxI then maxI = k end
+			if type(k) ~= "number" or k <= 0 or k % 1 ~= 0 then isList = false end
+		end
+		if n == 0 then return "{}" end
+		if isList and n == maxI then
+			local parts = {}
+			for i = 1, n do parts[i] = jsonEncode(v[i]) end
+			return "[" .. table.concat(parts, ",") .. "]"
+		end
+		local parts = {}
+		for k, val in pairs(v) do
+			table.insert(parts, jsonEncode(tostring(k)) .. ":" .. jsonEncode(val))
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	else
+		return jsonEncode(tostring(v))
+	end
+end
+
+local function serJSON(value, cap)
+	return jsonEncode(serializeValue(value, 0, nil, { count = 0, cap = cap or 4096 }))
+end
+
+--------------------------------------------------------------------
+-- REMOTE SPY (headless SimpleSpy-concept) --------------------------
+--------------------------------------------------------------------
+
+local Spy = {
+	hooked       = false,
+	origNamecall = nil,
+	hookWrapper  = nil,
+	incoming     = {},   -- instance -> connection object (or {invoke=true} marker)
+	invokeCbs    = {},   -- entries {inst=..., prev=oldCallback}
+	buffer       = {},   -- ring buffer of records
+	nextId       = 1,
+	total        = 0,
+}
+
+local OUTBOUND_METHODS = {
+	FireServer     = true,
+	InvokeServer   = true,
+	FireAllClients = true,
+	FireClient     = true,
+	InvokeClient   = true,
+}
+
+local SPY_CLASSES = {
+	RemoteEvent           = true,
+	RemoteFunction        = true,
+	UnreliableRemoteEvent = true,
+}
+
+local function spyRecord(dir, inst, method, argsTable)
+	if #Spy.buffer >= CONFIG.RemoteBufferCap then
+		table.remove(Spy.buffer, 1)
+	end
+	local caller
+	if Capabilities.getcallingscript then
+		local ok, s = pcall(getcallingscript)
+		if ok and typeof(s) == "Instance" then caller = pathOf(s) end
+	end
+	local budget = { count = 0, cap = 2048 }
+	local argsOut = {}
+	for i = 1, math.min(#argsTable, 16) do
+		argsOut[i] = serializeValue(argsTable[i], 0, nil, budget)
+		if budget.count >= budget.cap then break end
+	end
+	local rec = {
+		id     = Spy.nextId,
+		t      = os.time(),
+		dir    = dir,
+		path   = pathOf(inst) or "<detached>",
+		cls    = (typeof(inst) == "Instance" and inst.ClassName) or "?",
+		method = method,
+		args   = argsOut,
+		caller = caller,
+	}
+	Spy.nextId = Spy.nextId + 1
+	Spy.total = Spy.total + 1
+	table.insert(Spy.buffer, rec)
+end
+
+local function hookNamecall()
+	if Spy.hooked then return true end
+	if not Capabilities.hookmetamethod then return false end
+
+	local hookBody
+	hookBody = function(...)
+		-- executor calls the metamethod with self as the first argument
+		local args = { ... }
+		local method = getnamecallmethod()
+		local self = args[1]
+		if typeof(self) == "Instance" and SPY_CLASSES[self.ClassName] and type(method) == "string" and OUTBOUND_METHODS[method] then
+			local recArgs = {}
+			for i = 2, #args do recArgs[i - 1] = args[i] end
+			pcall(spyRecord, "Outgoing", self, method, recArgs)
+		end
+		return Spy.origNamecall(self, table.unpack(args, 2))
+	end
+
+	local wrapped
+	if Capabilities.newcclosure then
+		wrapped = newcclosure(hookBody)
+	else
+		wrapped = hookBody
+	end
+
+	local ok, original = pcall(hookmetamethod, game, "__namecall", wrapped)
+	if ok and typeof(original) == "function" then
+		Spy.origNamecall = original
+		Spy.hookWrapper = wrapped
+		Spy.hooked = true
+		return true
+	end
+	return false
+end
+
+local function unhookNamecall()
+	if not Spy.hooked then return end
+	pcall(hookfunction, Spy.hookWrapper, Spy.origNamecall)
+	Spy.hooked = false
+	Spy.hookWrapper = nil
+end
+
+local function listenIncomingRemote(inst)
+	if Spy.incoming[inst] ~= nil then return false end
+	local cls = inst.ClassName
+	if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
+		local okConn, conn = pcall(function()
+			return inst.OnClientEvent:Connect(function(...)
+				spyRecord("Incoming", inst, "OnClientEvent", { ... })
+			end)
+		end)
+		if okConn and conn then
+			Spy.incoming[inst] = conn
+			return true
+		end
+	elseif cls == "RemoteFunction" then
+		local prev
+		pcall(function() prev = inst.OnClientInvoke end)
+		local okSet = pcall(function()
+			inst.OnClientInvoke = function(...)
+				local inArgs = { ... }
+				spyRecord("Incoming", inst, "OnClientInvoke", inArgs)
+				-- '...' is scoped to the vararg function only: forward via packed args
+				local okPrev, prevRes = pcall(function()
+					if typeof(prev) == "function" then
+						return prev(table.unpack(inArgs, 1, #inArgs))
+					end
+					return nil
+				end)
+				if okPrev then return prevRes end
+				return nil
+			end
+		end)
+		if okSet then
+			Spy.incoming[inst] = { invoke = true }
+			table.insert(Spy.invokeCbs, { inst = inst, prev = prev })
+			return true
+		end
+	end
+	return false
+end
+
+local function attachIncoming()
+	local count = 0
+	local descendants
+	pcall(function() descendants = game:GetDescendants() end)
+	if typeof(descendants) ~= "table" then return 0 end
+	local seen = 0
+	for _, inst in ipairs(descendants) do
+		seen = seen + 1
+		if seen > 4000 then break end
+		local cls = inst.ClassName
+		if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" or cls == "RemoteFunction" then
+			if listenIncomingRemote(inst) then count = count + 1 end
+			if count >= CONFIG.RemoteIncomingCap then break end
+		end
+	end
+	return count
+end
+
+local function detachIncoming()
+	for _, conn in pairs(Spy.incoming) do
+		pcall(function()
+			if typeof(conn) == "RBXScriptConnection" then
+				conn:Disconnect()
+			end
+		end)
+	end
+	for _, entry in ipairs(Spy.invokeCbs) do
+		pcall(function()
+			if typeof(entry.inst) == "Instance" and entry.inst:IsDescendantOf(game) then
+				entry.inst.OnClientInvoke = entry.prev
+			end
+		end)
+	end
+	table.clear(Spy.incoming)
+	table.clear(Spy.invokeCbs)
+end
+
+local function spyStart()
+	local hooked = hookNamecall()
+	State.spy = true
+	local attached = 0
+	if State.incoming then attached = attachIncoming() end
+	saveState()
+	return { hooked = hooked, attached = attached }
+end
+
+local function spyStop()
+	unhookNamecall()
+	detachIncoming()
+	State.spy = false
+	saveState()
+end
+
+--------------------------------------------------------------------
+-- COMMANDS (names match the MCP tool names 1:1) --------------------
+--------------------------------------------------------------------
+
+local Commands = {}
+
+function Commands.status()
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		names[#names + 1] = p.Name
+	end
+	return {
+		ok = true,
+		data = {
+			session         = State.token,
+			transport       = "file",
+			cmdFile         = cmdFileName(),
+			resFile         = resFileName(),
+			sessionFile     = sessionFileName(),
+			delfile         = Capabilities.deletefile,
+			handled         = FileChannel.handled,
+			version         = VERSION,
+			executor        = EXECUTOR,
+			placeId         = game.PlaceId,
+			gameId          = game.GameId,
+			jobId           = game.JobId,
+			playerId        = (Players.LocalPlayer and Players.LocalPlayer.UserId) or 0,
+			playerName      = (Players.LocalPlayer and Players.LocalPlayer.Name) or "",
+			displayName     = (Players.LocalPlayer and Players.LocalPlayer.DisplayName) or "",
+			playerCount     = #Players:GetPlayers(),
+			players         = names,
+			spy             = { enabled = State.spy, incoming = State.incoming, hooked = Spy.hooked, buffer = #Spy.buffer, total = Spy.total },
+			allowRemoteAdds = State.allowRemoteAdds,
+			allowInterpret  = State.allowInterpret,
+			autoRestart     = State.autoRestart,
+			pollMs          = State.pollMs,
+			capabilities    = Capabilities,
+			uiLoaded        = (UI.window ~= nil),
+			fsAvailable     = fsAvailable(),
+		},
+	}
+end
+
+function Commands.game_info()
+	local placeName
+	pcall(function()
+		local product = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+		if type(product) == "table" then placeName = product.Name end
+	end)
+	if not placeName then placeName = ("PlaceId %s"):format(tostring(game.PlaceId)) end
+	return {
+		ok = true,
+		data = {
+			placeId         = game.PlaceId,
+			placeName       = placeName,
+			gameId          = game.GameId,
+			jobId           = game.JobId,
+			creatorId       = game.CreatorId,
+			creatorType     = tostring(game.CreatorType),
+			privateServer   = tostring(game.PrivateServerId ~= ""),
+			playerId        = (Players.LocalPlayer and Players.LocalPlayer.UserId) or 0,
+			playerName      = (Players.LocalPlayer and Players.LocalPlayer.Name) or "",
+			playerCount     = #Players:GetPlayers(),
+			joinedAt        = Session.joinTime,
+			uptimeS         = os.time() - Session.joinTime,
+			teleportHistory = Session.teleportHistory,
+			fsAvailable     = fsAvailable(),
+			autoRestart     = State.autoRestart,
+		},
+	}
+end
+
+function Commands.players(args)
+	local query = (args and type(args.query) == "string") and args.query:lower() or ""
+	local lp = Players.LocalPlayer
+	local myRoot = lp and lp.Character and lp.Character.PrimaryPart
+	local out = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		local row = {
+			playerId    = p.UserId,
+			name        = p.Name,
+			displayName = p.DisplayName,
+			team        = (p.Team and p.Team.Name) or "",
+			accountAge  = p.AccountAge,
+			distance    = 0,
+		}
+		if typeof(p.Character) == "Instance" then
+			local hum = p.Character:FindFirstChildOfClass("Humanoid")
+			local hrp = p.Character.PrimaryPart
+			row.characterPath = pathOf(p.Character)
+			if hrp then
+				local pos = hrp.Position
+				row.position = { x = pos.X, y = pos.Y, z = pos.Z }
+			end
+			if hum then
+				row.health = hum.Health
+				row.maxHealth = hum.MaxHealth
+				row.walkSpeed = hum.WalkSpeed
+			end
+			if myRoot and hrp then
+				row.distance = (myRoot.Position - hrp.Position).Magnitude
+			end
+		end
+		if query == ""
+			or p.Name:lower():find(query, 1, true)
+			or p.DisplayName:lower():find(query, 1, true) then
+			table.insert(out, row)
+		end
+	end
+	table.sort(out, function(a, b) return (a.distance or 0) < (b.distance or 0) end)
+	return { ok = true, data = { players = out, count = #out, myPlayerId = (lp and lp.UserId) or 0 } }
+end
+
+function Commands.my_player()
+	local lp = Players.LocalPlayer
+	if not lp then return { ok = false, error = "LocalPlayer not ready" } end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char.PrimaryPart
+	local camera = workspaceRef.CurrentCamera
+	local data = {
+		playerId    = lp.UserId,
+		name        = lp.Name,
+		displayName = lp.DisplayName,
+		accountAge  = lp.AccountAge,
+		membership  = tostring(lp.MembershipType),
+		gameId      = game.GameId,
+		placeId     = game.PlaceId,
+		jobId       = game.JobId,
+		joinedAt    = Session.joinTime,
+	}
+	if char then data.characterPath = pathOf(char) end
+	if root then
+		local pos = root.Position
+		local vel = root.AssemblyLinearVelocity
+		data.position = { x = pos.X, y = pos.Y, z = pos.Z }
+		data.velocity = { x = vel.X, y = vel.Y, z = vel.Z }
+	end
+	if hum then
+		data.humanoid = {
+			health = hum.Health, maxHealth = hum.MaxHealth,
+			walkSpeed = hum.WalkSpeed, jumpPower = hum.JumpPower,
+		}
+	end
+	if camera then
+		local camPos = camera.CFrame.Position
+		data.camera = { typeName = tostring(camera.CameraType), fov = camera.FieldOfView, pos = { x = camPos.X, y = camPos.Y, z = camPos.Z } }
+	end
+	return { ok = true, data = data }
+end
+
+function Commands.explore(args)
+	local root, err = resolvePath((args and args.path) or "game.Workspace")
+	if not root then return { ok = false, error = err } end
+	local depth = clamp((args and args.depth) or CONFIG.ExploreDefaults.depth, 1, CONFIG.ExploreMax.depth)
+	local maxNodes = clamp((args and args.maxNodes) or CONFIG.ExploreDefaults.maxNodes, 1, CONFIG.ExploreMax.maxNodes)
+	local classFilter = (args and args.classFilter and tostring(args.classFilter):lower()) or ""
+	local nameFilter  = (args and args.nameFilter and tostring(args.nameFilter):lower()) or ""
+
+	local nodes = {}
+	local stack = { { inst = root, d = 0 } }
+	while #stack > 0 and #nodes < maxNodes do
+		local entry = table.remove(stack)
+		local inst = entry.inst
+		local include = true
+		if classFilter ~= "" and inst.ClassName:lower():find(classFilter, 1, true) == nil then include = false end
+		if include and nameFilter ~= "" and inst.Name:lower():find(nameFilter, 1, true) == nil then include = false end
+		if include then
+			table.insert(nodes, { path = pathOf(inst), name = inst.Name, class = inst.ClassName, depth = entry.d })
+		end
+		if entry.d < depth then
+			local kids = inst:GetChildren()
+			for chi = #kids, 1, -1 do
+				table.insert(stack, { inst = kids[chi], d = entry.d + 1 })
+			end
+		end
+	end
+
+	return {
+		ok = true,
+		data = {
+			root      = pathOf(root),
+			depth     = depth,
+			maxNodes  = maxNodes,
+			count     = #nodes,
+			truncated = (#nodes >= maxNodes),
+			nodes     = nodes,
+		},
+	}
+end
+
+function Commands.search_instances(args)
+	local query = (args and type(args.query) == "string") and args.query or ""
+	if query == "" then return { ok = false, error = "query required" } end
+	local root, err = resolvePath((args and args.path) or "game")
+	if not root then return { ok = false, error = err } end
+	query = query:lower()
+	local classFilter = (args and args.classFilter and tostring(args.classFilter):lower()) or ""
+	local limit = clamp((args and args.limit) or CONFIG.SearchLimitDefault, 1, 500)
+
+	local results = {}
+	local scanned = 0
+	local truncatedNotice
+	local function tryInclude(inst)
+		local okName = inst.Name:lower():find(query, 1, true) ~= nil
+		local okClass = (classFilter == "") or inst.ClassName:lower():find(classFilter, 1, true) ~= nil
+		if okName and okClass then
+			table.insert(results, { path = pathOf(inst), name = inst.Name, class = inst.ClassName })
+			return true
+		end
+		return false
+	end
+	if not tryInclude(root) then
+		for _, inst in ipairs(root:GetDescendants()) do
+			scanned = scanned + 1
+			if scanned > CONFIG.SearchScanCap then
+				truncatedNotice = ("scan cap reached (%d descendants checked)"):format(CONFIG.SearchScanCap)
+				break
+			end
+			if #results >= limit then break end
+			tryInclude(inst)
+		end
+	end
+	return { ok = true, data = { query = (args and args.query) or "", scanned = scanned, count = #results, truncatedNotice = truncatedNotice, results = results } }
+end
+
+local COMMON_PROPS = {
+	"Name", "ClassName", "Parent", "CFrame", "Position", "Rotation", "Size", "Anchored", "CanCollide", "CanTouch", "CanQuery", "Locked", "Massless", "Material", "Color", "Transparency", "Reflectance",
+	"Health", "MaxHealth", "WalkSpeed", "JumpPower", "AutoRotate", "PlatformStand", "Sit", "FloorMaterial",
+	"Value",
+	"Text", "Font", "TextColor3", "BackgroundTransparency", "BackgroundColor3", "Visible", "ZIndex", "BorderSizePixel", "ScaleType", "Image", "ImageTransparency", "LayoutOrder",
+	"SoundId", "Playing", "Pitch", "Looped", "Volume", "PlaybackSpeed", "TimePosition",
+	"Disabled", "Active", "Width", "Height", "Length", "CurrentPage", "TextWrapped", "BundleId", "AssetId", "Object", "Playerbase",
+}
+
+function Commands.get_properties(args)
+	local inst, err = resolvePath((args and args.path) or "")
+	if not inst then return { ok = false, error = err } end
+	local requested = args and args.props
+	local list = (type(requested) == "table" and requested) or COMMON_PROPS
+	local propsOut, attempted, unreadable = {}, 0, 0
+	for _, pname in ipairs(list) do
+		attempted = attempted + 1
+		if attempted > 400 then break end
+		local ok, value = pcall(function() return inst[pname] end)
+		if ok then
+			propsOut[pname] = serializeValue(value, 1, nil, { count = 0, cap = 512 })
+		else
+			unreadable = unreadable + 1
+		end
+	end
+	return {
+		ok = true,
+		data = {
+			path = pathOf(inst),
+			className = inst.ClassName,
+			attempted = attempted,
+			unreadable = unreadable,
+			props = propsOut,
+		},
+	}
+end
+
+local function hexify(text, cap)
+	local parts = {}
+	for i = 1, math.min(#text, cap) do
+		parts[i] = ("%02x"):format(text:byte(i, i))
+	end
+	return table.concat(parts)
+end
+
+function Commands.get_source(args)
+	local inst, err = resolvePath((args and args.path) or "")
+	if not inst then return { ok = false, error = err } end
+	local isOk, isLua = pcall(function() return inst:IsA("LuaSourceContainer") end)
+	if not (isOk and isLua) then
+		return { ok = false, error = ("instance is %s, not a Lua script container"):format(tostring(inst.ClassName)) }
+	end
+	if Capabilities.decompile then
+		local ok, src = pcall(decompile, inst)
+		if ok and type(src) == "string" then
+			local truncated = (#src > CONFIG.DecodeSourceCap)
+			if truncated then src = src:sub(1, CONFIG.DecodeSourceCap) .. "\n--<truncated>" end
+			return { ok = true, data = { via = "decompile", path = pathOf(inst), size = #src, truncated = truncated, source = src } }
+		end
+	end
+	if Capabilities.bytecode then
+		local ok, bc = pcall(getscriptbytecode, inst)
+		if ok and type(bc) == "string" then
+			return { ok = true, data = { via = "bytecode", path = pathOf(inst), size = #bc, truncated = (#bc > CONFIG.DecodeSourceCap), payload_hex = hexify(bc, CONFIG.DecodeSourceCap) } }
+		end
+	end
+	return { ok = false, error = "executor exposes neither decompile() nor getscriptbytecode()" }
+end
+
+function Commands.remote_spy(args)
+	local mode = (args and type(args.mode) == "string") and args.mode or "status"
+	local output
+	if mode == "on" then
+		if args and type(args.incoming) == "boolean" then State.incoming = args.incoming end
+		local result = spyStart()
+		output = { hooked = result.hooked, incomingAttached = result.attached, incoming = State.incoming }
+	elseif mode == "off" then
+		spyStop()
+		output = { hooked = Spy.hooked, incoming = State.incoming }
+	else
+		local listenerCount = 0
+		for _ in pairs(Spy.incoming) do listenerCount = listenerCount + 1 end
+		output = {
+			enabled   = State.spy,
+			hooked    = Spy.hooked,
+			incoming  = State.incoming,
+			listeners = listenerCount,
+			buffer    = #Spy.buffer,
+			total     = Spy.total,
+		}
+	end
+	return { ok = true, data = output }
+end
+
+function Commands.remote_calls(args)
+	local limit = clamp((args and args.limit) or 50, 1, CONFIG.RemoteBufferCap)
+	local sinceId = tonumber((args and args.sinceId) or 0) or 0
+	local kind = (args and type(args.kind) == "string") and args.kind or ""
+	local search = ((args and type(args.search) == "string") and args.search or ""):lower()
+
+	local out = {}
+	for i = #Spy.buffer, 1, -1 do
+		if #out >= limit then break end
+		local rec = Spy.buffer[i]
+		local clsMatch = (kind == "") or (rec.dir == kind)
+		local pathMatch = (search == "") or (rec.path:lower():find(search, 1, true) ~= nil)
+		if rec.id > sinceId and clsMatch and pathMatch then
+			table.insert(out, rec)
+		end
+	end
+	local cleared = false
+	if args and args.clear == true then
+		table.clear(Spy.buffer)
+		cleared = true
+	end
+	return { ok = true, data = { total = Spy.total, count = #out, records = out, cleared = cleared } }
+end
+
+local function decodeArgValue(v, depth)
+	if depth > (CONFIG.ArgDepth or 4) then return nil end
+	if typeof(v) ~= "table" then return v end
+
+	if v.t == "instance" or v.t == "Instance" then
+		local inst = (type(v.path) == "string") and resolvePath(v.path) or nil
+		return inst
+	elseif v.t == "Vector3" then
+		return Vector3.new(tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
+	elseif v.t == "Vector2" then
+		return Vector2.new(tonumber(v.x) or 0, tonumber(v.y) or 0)
+	elseif v.t == "CFrame" and type(v.pos) == "table" then
+		return CFrame.new(tonumber(v.pos.x) or 0, tonumber(v.pos.y) or 0, tonumber(v.pos.z) or 0)
+	elseif v.t == "Color3" then
+		return Color3.new(tonumber(v.r) or 0, tonumber(v.g) or 0, tonumber(v.b) or 0)
+	elseif v.t == "EnumItem" then
+		-- serializeValue stores tostring(emi) which is "EnumType.Item" or "Enum.EnumType.Item"
+		local fullName = tostring(v.name or "")
+		local parts = fullName:split(".")
+		local enumName, itemName
+		if parts[1] == "Enum" then
+			enumName, itemName = parts[2], parts[3]
+		else
+			enumName, itemName = parts[1], parts[2]
+		end
+		if (not itemName) and type(v.enumType) == "string" then
+			-- fall back to the recorded enum type ("Enum.Material")
+			local fromType = v.enumType:gsub("^Enum%.", "")
+			if fromType and #fromType > 0 then enumName = fromType end
+			local fromName = fullName:match("%w+%.([%w_%s]+)$")
+			if fromName then itemName = fromName end
+		end
+		if not enumName or not itemName then return nil end
+		local enumTable = Enum[enumName]
+		if not enumTable then return nil end
+		return enumTable[itemName]
+	elseif (v.t == "number" or v.t == "string") and type(v.repr) == "string" then
+		return tostring(v.repr)
+	elseif v.t == "boolean" and v.repr ~= nil then
+		return (tostring(v.repr) == "true")
+	elseif v.t ~= nil and v.t ~= "table" then
+		-- opaque / non-replayable value: surface its textual form
+		return tostring(v.repr or v.t)
+	end
+
+	-- plain structural table (v.t may be nil, or "table")
+	if v.t == "table" and (v.cycle == true or v.truncated == true) then
+		return {}
+	end
+	local len = #v
+	local isArr = (len > 0) and (v[1] ~= nil) and (next(v, len) == nil)
+	local out = {}
+	if isArr then
+		for i = 1, len do
+			out[i] = decodeArgValue(v[i], depth + 1)
+		end
+		return out
+	end
+	for k, subv in pairs(v) do
+		if k == "t" then
+			-- serialized wrapper meta — skip
+		elseif type(k) == "number" or type(k) == "string" then
+			out[k] = decodeArgValue(subv, depth + 1)
+		end
+	end
+	return out
+end
+
+function Commands.call_remote(args)
+	if not State.allowRemoteAdds then
+		return { ok = false, error = "remote calls are disabled in the game UI ('Allow remote calls')" }
+	end
+	local inst, err = resolvePath((args and args.path) or "")
+	if not inst then return { ok = false, error = err } end
+	local cls = inst.ClassName
+	local method = (args and type(args.method) == "string" and args.method ~= "") and args.method or ""
+	if method == "" then
+		method = (cls == "RemoteFunction") and "InvokeServer" or "FireServer"
+	end
+	local allowed = (cls == "RemoteEvent" and method == "FireServer")
+		or (cls == "UnreliableRemoteEvent" and method == "FireServer")
+		or (cls == "RemoteFunction" and method == "InvokeServer")
+	if not allowed then
+		return { ok = false, error = ("class %s does not expose %s"):format(cls, method) }
+	end
+	local rawArgs = (args and type(args.args) == "table") and args.args or {}
+	local finalArgs = {}
+	for _, argv in ipairs(rawArgs) do
+		table.insert(finalArgs, decodeArgValue(argv, 0))
+	end
+	local okCall, resultsPack = pcall(function()
+		return table.pack(inst[method](table.unpack(finalArgs)))
+	end)
+	if not okCall or typeof(resultsPack) ~= "table" then
+		return { ok = false, error = "call failed: " .. tostring(resultsPack) }
+	end
+	local out = {}
+	for i = 1, resultsPack.n do
+		out[i] = serializeValue(resultsPack[i], 0, nil, { count = 0, cap = 512 })
+	end
+	return {
+		ok = true,
+		data = {
+			path        = pathOf(inst),
+			class       = cls,
+			method      = method,
+			results     = out,
+			resultCount = resultsPack.n,
+		},
+	}
+end
+
+function Commands.logs(args)
+	local limit = clamp((args and args.limit) or 80, 1, 400)
+	local okHistory, history = pcall(function() return LogService:GetLogHistory() end)
+	if not okHistory or type(history) ~= "table" then
+		return { ok = false, error = "LogService:GetLogHistory unavailable" }
+	end
+	local out = {}
+	for i = math.max(1, #history - limit + 1), #history do
+		local entry = history[i]
+		table.insert(out, {
+			t       = entry.time,
+			kind    = tostring(entry.messageType),
+			message = (type(entry.message) == "string" and entry.message:sub(1, 800)) or tostring(entry.message),
+		})
+	end
+	return { ok = true, data = { count = #out, logs = out } }
+end
+
+function Commands.luau(args)
+	if not State.allowInterpret then
+		return { ok = false, error = "interpreter disabled in the game UI ('Allow interpreter')" }
+	end
+	local code = (args and args.code) or ""
+	if type(code) ~= "string" or #code == 0 then return { ok = false, error = "code string required" } end
+	local chunkFn, diag = loadstring(code)
+	if not chunkFn then return { ok = false, error = "compile error: " .. tostring(diag) } end
+	local okRun, firstResult = pcall(chunkFn)
+	if not okRun then return { ok = false, error = "runtime: " .. tostring(firstResult) } end
+	local serialized = serializeValue(firstResult, 0, nil, { count = 0, cap = 4096 })
+	return { ok = true, data = { result = serialized } }
+end
+
+--------------------------------------------------------------------
+-- COMMAND LOOP (zero-dependency file channel) ----------------------
+--------------------------------------------------------------------
+
+local LoopActive = false
+local LoopThread = nil
+local processedCmdIds = {}
+local processedCount = 0
+
+local function clampPollMs()
+	return clamp(State.pollMs, 250, 5000)
+end
+
+local function deliverCommand(cmd)
+	local fn = Commands[cmd.fn]
+	if type(fn) ~= "function" then
+		return { id = cmd.id, ok = false, error = "unknown command: " .. tostring(cmd.fn) }
+	end
+	local okCmd, cmdOut = pcall(fn, cmd.args)
+	if not okCmd then
+		return { id = cmd.id, ok = false, error = tostring(cmdOut or "command errored") }
+	end
+	if type(cmdOut) ~= "table" then
+		return { id = cmd.id, ok = false, error = "bad command payload" }
+	end
+	if cmdOut.ok == false then
+		return { id = cmd.id, ok = false, error = tostring(cmdOut.error or "command failed") }
+	end
+	return { id = cmd.id, ok = true, data = cmdOut.data }
+end
+
+--------------------------------------------------------------------
+-- FILE CHANNEL (agent drops commands, game answers) -----------------
+--------------------------------------------------------------------
+
+local FileChannel = {
+	pingAt      = 0,
+	lastHandled = 0,
+	handled     = 0,
+}
+
+local function writeJSONFile(name, tbl, cap)
+	if not fsAvailable() then return false end
+	local payload = serJSON(tbl, cap or 32768)
+	return pcall(writefile, name, payload)
+end
+
+local function refreshSessionFile()
+	if not fsAvailable() then return end
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		names[#names + 1] = p.Name
+	end
+	local blob = {
+		rpc         = CONFIG.CmdRpcMagic,
+		uuid        = State.token,
+		running     = State.running,
+		paused      = (not State.enabled),
+		version     = VERSION,
+		executor    = EXECUTOR,
+		placeId     = game.PlaceId,
+		gameId      = game.GameId,
+		jobId       = game.JobId,
+		userId      = (Players.LocalPlayer and Players.LocalPlayer.UserId) or 0,
+		playerName  = (Players.LocalPlayer and Players.LocalPlayer.Name) or "",
+		displayName = (Players.LocalPlayer and Players.LocalPlayer.DisplayName) or "",
+		playerCount = #Players:GetPlayers(),
+		players     = names,
+		updatedAt   = os.time(),
+	}
+	writeJSONFile(sessionFileName(), blob, 4096)
+end
+
+local function maybePingSession()
+	if os.time() - FileChannel.pingAt >= CONFIG.SessionPingS then
+		FileChannel.pingAt = os.time()
+		refreshSessionFile()
+	end
+end
+
+local function writeCommandResult(id, okFlag, data, errMsg)
+	return writeJSONFile(resFileName(), {
+		rpc     = CONFIG.CmdRpcMagic,
+		id      = id,
+		ok      = okFlag,
+		data    = data,
+		error   = errMsg,
+		session = State.token,
+		time    = os.time(),
+	}, 32768)
+end
+
+local function filePollCycle()
+	if not fsAvailable() then return false end
+	maybePingSession()
+
+	local okIs, exists = pcall(isfile, cmdFileName())
+	if not (okIs and exists) then return true end
+	local okR, raw = pcall(readfile, cmdFileName())
+	if not okR or type(raw) ~= "string" or #raw == 0 then return true end
+
+	local okD, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not okD or type(decoded) ~= "table"
+		or decoded.rpc ~= CONFIG.CmdRpcMagic
+		or type(decoded.id) ~= "string"
+		or type(decoded.fn) ~= "string" then
+		-- torn write or foreign content: leave it for the next tick
+		return true
+	end
+
+	local cmd = { id = decoded.id, fn = decoded.fn, args = decoded.args }
+	local cached = processedCmdIds[cmd.id]
+	local out
+	if cached then
+		out = cached
+	elseif not State.enabled then
+		-- paused: explicit answer so the agent sees why nothing ran
+		out = { id = cmd.id, ok = false, error = "MCP paused: toggled off in the game UI" }
+		processedCmdIds[cmd.id] = out
+		processedCount = processedCount + 1
+	else
+		out = deliverCommand(cmd)
+		processedCmdIds[cmd.id] = out
+		processedCount = processedCount + 1
+	end
+	if processedCount > 2400 then
+		table.clear(processedCmdIds)
+		processedCount = 0
+	end
+
+	FileChannel.handled = FileChannel.handled + 1
+	FileChannel.lastHandled = os.time()
+	writeCommandResult(out.id, out.ok, out.data, out.error)
+	-- neutralize the answered envelope so a later dedupe-cache reset can never
+	-- re-execute it: blank it first, then remove it when the executor allows
+	pcall(writefile, cmdFileName(), "")
+	if Capabilities.deletefile then
+		pcall(delfile, cmdFileName())
+	end
+	return true
+end
+
+local function loopRunner()
+	while LoopActive do
+		pcall(filePollCycle)
+		task.wait(clampPollMs() / 1000)
+	end
+end
+
+local function startLoop()
+	if LoopActive then return end
+	LoopActive = true
+	State.running = true
+	LoopThread = task.spawn(loopRunner)
+end
+
+local function stopLoop()
+	LoopActive = false
+	State.running = false
+	LoopThread = nil
+end
+
+local function setMasterEnabled(enable)
+	State.enabled = enable
+	saveState()
+	refreshSessionFile()
+	-- the loop keeps breathing while paused so pending commands still get an
+	-- explicit 'paused' answer and the session file keeps the paused flag fresh
+	if enable then
+		startLoop()
+	end
+end
+
+--------------------------------------------------------------------
+-- TELEPORT AUTO RESTART --------------------------------------------
+--------------------------------------------------------------------
+
+local BOOT_TEMPLATE = [[
+do
+	local isfileF, readfileF, loadF = isfile, readfile, loadstring
+	if typeof(isfileF) ~= "function" or typeof(readfileF) ~= "function" or typeof(loadF) ~= "function" then
+		return
+	end
+	local stateFile = STATE_FILE_NAME
+	local sourceCandidates = SOURCE_CANDIDATES
+	local okExists, exists = pcall(isfileF, stateFile)
+	if not okExists or not exists then return end
+	local okRead, content = pcall(readfileF, stateFile)
+	if not okRead or type(content) ~= "string" then return end
+	if not content:match('"enabled"%s*:%s*true') then return end
+	if not content:match('"autoRestart"%s*:%s*true') then return end
+	local firstGameId = tonumber(content:match('"gameId"%s*:%s*(-?%d+)') or -1)
+	if firstGameId ~= game.GameId then return end
+	for _, candidate in ipairs(sourceCandidates) do
+		if isfileF(candidate) then
+			local okChunk, chunk = pcall(loadF, readfileF(candidate))
+			if okChunk and chunk then
+				pcall(chunk)
+			end
+			break
+		end
+	end
+end]]
+
+local function buildBootstrap()
+	local candidates = {}
+	for _, name in ipairs(CONFIG.SourceCandidates) do
+		table.insert(candidates, ('%q'):format(name))
+	end
+	local candList = "{" .. table.concat(candidates, ",") .. "}"
+	local out = BOOT_TEMPLATE:gsub("STATE_CANDIDATES", candList)
+	out = out:gsub("STATE_FILE_NAME", ('%q'):format(stateFileName()))
+	return out
+end
+
+local function queueAutoRestart()
+	if (not Capabilities.queue_on_teleport) or (not fsAvailable()) then
+		return false
+	end
+	if not State.autoRestart then
+		pcall(queue_on_teleport, "-- ReverseMCP auto-restart disabled")
+		return false
+	end
+	State.gameId = game.GameId
+	State.placeId = game.PlaceId
+	if not saveState() then return false end
+	pcall(queue_on_teleport, buildBootstrap())
+	return true
+end
+
+--------------------------------------------------------------------
+-- SHUTDOWN ---------------------------------------------------------
+--------------------------------------------------------------------
+
+local function shutdownAll(reason)
+	stopLoop()
+	if State.spy then
+		pcall(spyStop)
+	else
+		pcall(detachIncoming)
+	end
+	State.enabled = false
+	State.autoRestart = false
+	State.running = false
+	saveState()
+	-- last session heartbeat tells the AI this run is gone (paused + not running)
+	pcall(refreshSessionFile)
+	pcall(function()
+		if Capabilities.queue_on_teleport then
+			queue_on_teleport("-- ReverseMCP stopped (" .. tostring(reason or "shutdown") .. ")")
+		end
+	end)
+	table.clear(Spy.buffer)
+	table.clear(processedCmdIds)
+end
+
+--------------------------------------------------------------------
+-- UI ---------------------------------------------------------------
+--------------------------------------------------------------------
+
+local SILK_PINNED_COMMIT = "35ec0db18c7d1f9c663c4e509a07c6fb02208b07"
+local SILK_URL = "https://raw.githubusercontent.com/levox00/silk-windui/" .. SILK_PINNED_COMMIT .. "/dist/SilkWindUI.luau"
+
+local function clipboardCopy(text)
+	if typeof(setclipboard) == "function" then
+		pcall(setclipboard, text)
+		return true
+	end
+	if typeof(toclipboard) == "function" then
+		pcall(toclipboard, text)
+		return true
+	end
+	return false
+end
+
+local function statusSummary()
+	local lp = Players.LocalPlayer
+	local listenerCount = 0
+	for _ in pairs(Spy.incoming) do listenerCount = listenerCount + 1 end
+	local lines = {
+		State.enabled and "MCP: RUNNING" or "MCP: PAUSED",
+		"Session: " .. tostring(State.token),
+		"Channel: file drop (" .. cmdFileName() .. " -> " .. resFileName() .. ")",
+		"Executor: " .. EXECUTOR,
+		"Player id: " .. tostring(lp and lp.UserId or "?") .. "  (" .. tostring(lp and lp.DisplayName or "?") .. ")",
+		"Place: " .. tostring(game.PlaceId) .. "  /  universe " .. tostring(game.GameId),
+		"Spy: " .. (Spy.hooked and "hooked" or "off") .. "  |  buffer " .. tostring(#Spy.buffer) .. "  |  listeners " .. tostring(listenerCount),
+		"gates: remoteCalls " .. (State.allowRemoteAdds and "allow" or "block") .. "  /  interpreter " .. (State.allowInterpret and "allow" or "block"),
+		"auto-restart: " .. (State.autoRestart and "on" or "off") .. (fsAvailable() and "" or "  (no file API)"),
+		"handled commands: " .. tostring(FileChannel.handled),
+	}
+	if not fsAvailable() then
+		table.insert(lines, 3, "WARNING: executor has no writefile/readfile — the file channel cannot run.")
+	end
+	return table.concat(lines, "\n")
+end
+
+local AI_CLIENTS = {
+	"File playbook (any terminal agent)", "Claude Code", "OpenCode", "Codex CLI",
+	"Cursor", "VS Code (Copilot agent)", "Windsurf", "Cline / Roo Code",
+	"Gemini CLI", "Claude Desktop (needs file access)",
+}
+
+local CLIENT_HINTS = {
+	["Claude Code"]                        = "Put this into AGENTS.md at your project root (or just paste it in the chat).",
+	["OpenCode"]                           = "Put this into AGENTS.md (or paste it in chat). OpenCode has shell + file access.",
+	["Codex CLI"]                          = "Put this into AGENTS.md in your project dir.",
+	["Cursor"]                             = "Put this into .cursor/rules (or paste into chat).",
+	["VS Code (Copilot agent)"]            = "Put this into .github/copilot-instructions.md.",
+	["Windsurf"]                           = "Put this into .windsurf/rules.",
+	["Cline / Roo Code"]                   = "Put this into .clinerules / .roo/rules (or paste into chat).",
+	["Gemini CLI"]                         = "Put this into GEMINI.md in your project dir.",
+	["Claude Desktop (needs file access)"] = "Claude Desktop chat itself cannot read local files by default — prefer a terminal agent (Claude Code / OpenCode / Codex CLI). The playbook below only helps when such file access is attached.",
+}
+
+local PLAYBOOK_TEMPLATE = [==[
+# ReverseMCP — controlling the live Roblox game run (zero node, zero server)
+#
+# The game run announces itself as a file named:
+#   {SES}
+# inside the executor's workspace folder. That file carries the run uuid,
+# executor name, placeId/gameId and a paused flag. One rule: the command
+# envelope below is dropped as "{CMD}", the run answers via "{RES}".
+#
+# fn must be one of:
+#   status game_info players my_player explore search_instances
+#   get_properties get_source remote_spy remote_calls call_remote logs luau
+#
+# 0) Find the run (one-time; the folder of the session file is <dir>):
+Get-ChildItem "$env:USERPROFILE\Documents","$env:APPDATA","$env:LOCALAPPDATA","D:\","C:\" -Depth 6 -Filter "{SES}" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 5 FullName
+
+# 1) Run a tool (example: explore). Replace <dir> with the folder from step 0:
+$dir="<dir>"
+@{ rpc="rmcp-rpc-1"; id=[guid]::NewGuid().ToString("N"); fn="explore"; args=@{ path="game.Workspace"; depth=3; maxNodes=800 } } | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath "$dir\{CMD}" -Encoding UTF8
+
+# 2) Read the answer (usually ready in under a second):
+Get-Content -LiteralPath "$dir\{RES}" -Raw
+
+# Answer shape: { "rpc":..., "id":..., "ok":true/false, "data":... or "error":..., "session":..., "time":... }
+# - ok=false -> read "error" (e.g. 'MCP paused: toggled off in the game UI').
+# - One command at a time; new envelope replaces the old one; the run dedupes by id.
+# - Several games open at once -> one session/cmd/res trio per run (suffix in the
+#   file name); the "session" field of the answer echoes exactly which run replied.
+#
+# Gate notices from the game UI:
+#   - call_remote refuses while 'Allow remote calls' is off in the game window.
+#   - luau refuses while 'Allow interpreter' is off.
+]==]
+
+local KICKOFF = [==[
+I am inside a Roblox game with ReverseMCP running (file channel: no node, no server).
+Step 0: find my run — locate the newest ReverseMCP.session.*.json with PowerShell (playbook below). Its folder is <dir>; the file contains the run uuid.
+Step 1: drop the command envelope for fn="status" exactly as the playbook shows, then read the result file. If ok=false or nothing arrives, tell me (game window may be paused; 'MCP On/Off' toggle in the Reverse MCP window).
+Step 2: run fn="game_info" and summarize the experience (place name/id, universe, creator, player count) in two lines.
+Step 3: follow my further instructions on what to reverse in this game — instances, remotes, scripts, players — using the tools from the playbook.
+Careful: 'call_remote' performs real game traffic; use it only when I explicitly confirm.]==]
+
+local function filePlaybook()
+	return PLAYBOOK_TEMPLATE
+		:gsub("%{CMD%}", cmdFileName())
+		:gsub("%{RES%}", resFileName())
+		:gsub("%{SES%}", sessionFileName())
+end
+
+local function buildSnippet(client)
+	local hint = CLIENT_HINTS[client] or "Paste into the chat or the agent instructions file of your client."
+	local book = filePlaybook()
+	return {
+		header = "zero-install file channel — " .. hint,
+		config = book,
+		prompt = KICKOFF .. "\n\n" .. book,
+	}
+end
+
+local function buildUI()
+	local okHttp, chunk = pcall(function() return game:HttpGet(SILK_URL) end)
+	if not okHttp or type(chunk) ~= "string" then
+		return false
+	end
+	local okLoad, factory = pcall(loadstring, chunk, "SilkWindUI")
+	if not okLoad or type(factory) ~= "function" then return false end
+	local okFactory, WindUI = pcall(factory)
+	if not okFactory or type(WindUI) ~= "table" then return false end
+
+	local window = WindUI:CreateWindow({
+		Title = "Reverse MCP",
+		Icon = "crosshair",
+		Author = "zero-install file channel",
+		Folder = "ReverseMCP",
+		Size = UDim2.fromOffset(320, 430),
+		MinSize = Vector2.new(290, 380),
+		MaxSize = Vector2.new(640, 720),
+		Transparent = false,
+		Theme = "Dark",
+		NewElements = true,
+		Resizable = true,
+		SideBarWidth = 120,
+		HideSearchBar = true,
+		ScrollBarEnabled = true,
+		OpenButton = {
+			Title = "Reverse MCP",
+			CornerRadius = UDim.new(1, 0),
+			StrokeThickness = 2,
+			Enabled = true,
+			Draggable = true,
+			OnlyMobile = false,
+			Color = ColorSequence.new(Color3.fromHex("#4ea2ff"), Color3.fromHex("#1e40ff")),
+		},
+		Topbar = { Height = 42, ButtonsType = "Default" },
+	})
+	UI.window = window
+	UI.notify = function(cfg) pcall(function() WindUI:Notify(cfg) end) end
+
+	local overviewTab = window:Tab({ Title = "Overview", Icon = "info" })
+	local mcpTab      = window:Tab({ Title = "MCP", Icon = "toggle-right" })
+	local settingsTab = window:Tab({ Title = "Settings", Icon = "settings" })
+
+	local overviewSec = overviewTab:Section({ Title = "Live session" })
+	UI.overviewParagraph = overviewSec:Paragraph({
+		Title = "Session",
+		Desc = statusSummary(),
+	})
+	overviewTab:Button({
+		Title = "Copy player id",
+		Icon = "copy",
+		Callback = function()
+			local id = (Players.LocalPlayer and Players.LocalPlayer.UserId) or 0
+			if clipboardCopy(tostring(id)) then
+				UI.notify({ Title = "Copied", Content = "PlayerId " .. tostring(id), Duration = 2 })
+			end
+		end,
+	})
+	overviewTab:Button({
+		Title = "Copy session id (uuid)",
+		Icon = "copy",
+		Callback = function()
+			if clipboardCopy(tostring(State.token)) then
+				UI.notify({ Title = "Copied", Content = "Session uuid copied", Duration = 2 })
+			end
+		end,
+	})
+	overviewTab:Button({
+		Title = "Copy place id",
+		Icon = "copy",
+		Callback = function()
+			if clipboardCopy(tostring(game.PlaceId)) then
+				UI.notify({ Title = "Copied", Content = "PlaceId " .. tostring(game.PlaceId), Duration = 2 })
+			end
+		end,
+	})
+	overviewTab:Button({
+		Title = "Shutdown MCP & close",
+		Color = Color3.fromHex("#c92a2a"),
+		Callback = function()
+			shutdownAll("window close button")
+			UI.window = nil
+			window:Destroy()
+		end,
+	})
+
+	mcpTab:Section({ Title = "Agent" })
+	mcpTab:Toggle({
+		Title = "MCP On/Off",
+		Desc = "Runs or pauses the command loop serving your AI agent. OFF answers queued calls with 'paused'.",
+		Value = State.enabled,
+		Callback = function(v)
+			setMasterEnabled(v)
+		end,
+	})
+	mcpTab:Toggle({
+		Title = "Remote spy (outbound hook)",
+		Desc = "Intercept :FireServer / :InvokeServer namecalls made by game scripts.",
+		Value = State.spy,
+		Callback = function(v)
+			if v then spyStart() else spyStop() end
+		end,
+	})
+	mcpTab:Toggle({
+		Title = "Capture incoming remotes",
+		Desc = "Scan the tree and attach OnClientEvent / OnClientInvoke listeners.",
+		Value = State.incoming,
+		Callback = function(v)
+			State.incoming = v
+			if v then attachIncoming() else detachIncoming() end
+			saveState()
+		end,
+	})
+	mcpTab:Section({ Title = "Agent gates" })
+	mcpTab:Toggle({
+		Title = "Allow remote calls",
+		Desc = "Let the agent replay remotes (call_remote). Real traffic when allowed.",
+		Value = State.allowRemoteAdds,
+		Callback = function(v)
+			State.allowRemoteAdds = v
+			saveState()
+		end,
+	})
+	mcpTab:Toggle({
+		Title = "Allow interpreter",
+		Desc = "Let the agent probe with the restricted Luau tool.",
+		Value = State.allowInterpret,
+		Callback = function(v)
+			State.allowInterpret = v
+			saveState()
+		end,
+	})
+	mcpTab:Section({ Title = "Automation" })
+	mcpTab:Toggle({
+		Title = "Auto-restart after teleports",
+		Desc = "Re-executes this script automatically between places of the same experience.",
+		Value = State.autoRestart,
+		Callback = function(v)
+			State.autoRestart = v
+			queueAutoRestart()
+			saveState()
+		end,
+	})
+	mcpTab:Dropdown({
+		Title = "Polling rate",
+		Values = { "300 ms", "600 ms", "1000 ms", "2000 ms" },
+		Value = (State.pollMs <= 350 and "300 ms") or (State.pollMs <= 700 and "600 ms") or (State.pollMs <= 1100 and "1000 ms") or "2000 ms",
+		Callback = function(v)
+			local ms = tonumber((v:lower():match("(%d+)")))
+			State.pollMs = clamp(ms or 600, 250, 5000)
+			saveState()
+		end,
+	})
+	mcpTab:Button({
+		Title = "Clear spy buffer",
+		Callback = function()
+			table.clear(Spy.buffer)
+			UI.notify({ Title = "Spy", Content = "buffer cleared", Duration = 2 })
+		end,
+	})
+
+	local SettingsSec = settingsTab:Section({ Title = "AI client" })
+	local selectedClient = "File playbook (any terminal agent)"
+	local refreshClientSnippet
+	settingsTab:Dropdown({
+		Title = "Client",
+		Desc = "Snippet carries this run's file-channel playbook.",
+		Values = AI_CLIENTS,
+		Value = selectedClient,
+		Callback = function(v)
+			selectedClient = v
+			if refreshClientSnippet then refreshClientSnippet() end
+		end,
+	})
+	local function snippetDesc(client)
+		local s = buildSnippet(client)
+		return "(" .. s.header .. ")\n\n" .. s.config
+	end
+	-- the ButtonS ARRAY on a Paragraph is an unverified cosmetic in the pinned
+	-- Silk build: render with buttons, fall back to a plain paragraph
+	local okPara = pcall(function()
+		UI.configParagraph = settingsTab:Paragraph({
+			Title = selectedClient .. " config",
+			Desc = snippetDesc(selectedClient),
+			Buttons = {
+				{
+					Title = "Copy config",
+					Icon = "copy",
+					Callback = function()
+						if clipboardCopy(buildSnippet(selectedClient).config) then
+							UI.notify({ Title = "Copied", Content = "Playbook copied", Duration = 2 })
+						end
+					end,
+				},
+				{
+					Title = "Copy prompt",
+					Icon = "copy",
+					Callback = function()
+						if clipboardCopy(buildSnippet(selectedClient).prompt) then
+							UI.notify({ Title = "Copied", Content = "Kick-off prompt copied", Duration = 2 })
+						end
+					end,
+				},
+			},
+		})
+	end)
+	if not okPara or not UI.configParagraph then
+		pcall(function()
+			UI.configParagraph = settingsTab:Paragraph({
+				Title = selectedClient .. " config",
+				Desc = "[buttons unsupported] " .. snippetDesc(selectedClient),
+			})
+		end)
+	end
+	refreshClientSnippet = function()
+		local st = buildSnippet(selectedClient)
+		if UI.configParagraph then
+			pcall(function()
+				UI.configParagraph:SetTitle(selectedClient .. " config")
+				UI.configParagraph:SetDesc("(" .. st.header .. ")\n\n" .. st.config)
+			end)
+		end
+	end
+	refreshClientSnippet()
+
+	settingsTab:Section({ Title = "Shutdown" })
+	settingsTab:Button({
+		Title = "Shutdown (unloads hooks & state)",
+		Color = Color3.fromHex("#c92a2a"),
+		Callback = function()
+			shutdownAll("settings shutdown button")
+			if UI.window then
+				pcall(function() UI.window:Destroy() end)
+				UI.window = nil
+			end
+		end,
+	})
+
+	window:OnDestroy(function()
+		shutdownAll("window destroyed")
+		UI.window = nil
+	end)
+
+	task.spawn(function()
+		while UI.window ~= nil do
+			pcall(function()
+				if UI.overviewParagraph and UI.overviewParagraph.SetDesc then
+					UI.overviewParagraph:SetDesc(statusSummary())
+				end
+			end)
+			task.wait(CONFIG.StatusRefreshS)
+		end
+	end)
+
+	return true
+end
+
+--------------------------------------------------------------------
+-- FIRST RUN --------------------------------------------------------
+--------------------------------------------------------------------
+
+local attempts = 0
+while Players.LocalPlayer == nil and attempts < 20 do
+	task.wait(0.1)
+	attempts = attempts + 1
+end
+
+if not Capabilities.filesystem then
+	warn("[ReverseMCP] executor has no writefile/readfile — the file channel cannot run without it. UI will boot, MCP stays dead.")
+end
+
+if typeof(Players.LocalPlayer) ~= "Instance" then
+	warn("[ReverseMCP] LocalPlayer never appeared — exiting.")
+	return
+end
+
+local builtOk = buildUI()
+if not builtOk then
+	warn("[ReverseMCP] UI runtime failed (offline or GitHub unreachable). Per design the MCP does not run without the window — re-execute once online.")
+	return
+end
+
+if State.spy then
+	pcall(spyStart)
+elseif State.incoming then
+	pcall(attachIncoming)
+end
+
+-- loop always breathes (heartbeat + paused answers) while the window exists;
+-- State.enabled decides whether real commands are executed
+if fsAvailable() then
+	startLoop()
+end
+
+if State.autoRestart then
+	pcall(queueAutoRestart)
+end
+
+_G.RMCP = {
+	version  = VERSION,
+	state    = State,
+	files    = {
+		cmd     = cmdFileName(),
+		res     = resFileName(),
+		session = sessionFileName(),
+		state   = stateFileName(),
+	},
+	shutdown = function()
+		shutdownAll("script-level call")
+		if UI.window then pcall(function() UI.window:Destroy() end) end
+	end,
+}
+
+warn("[ReverseMCP] v" .. VERSION .. " loaded. UI is up. File channel: " .. cmdFileName() .. " -> " .. resFileName() .. " in the executor workspace.")
